@@ -410,12 +410,15 @@ def parse_csv_rows(csv_text: str):
 
 
 def post_rows(rows: list):
+    # Generous timeout: the Web App upserts into a month file that grows to
+    # ~25k rows; Apps Script's own hard limit is 6 minutes, so wait for it
+    # rather than declaring failure while it is still writing.
     resp = requests.post(
         WEBAPP_URL,
         params={"token": WEBAPP_TOKEN},
         data=json.dumps({"rows": rows}),
         headers={"Content-Type": "application/json"},
-        timeout=60,
+        timeout=360,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -461,8 +464,9 @@ def main():
 
     result = post_rows(rows)
     print(
-        f"Posted {result.get('rows_received')} rows; "
-        f"{result.get('duplicates_removed')} duplicate mission_sas_id row(s) removed, "
+        f"Posted {result.get('rows_received')} rows: "
+        f"{result.get('rows_updated')} updated in place, {result.get('rows_appended')} appended; "
+        f"{result.get('duplicates_removed')} stray duplicate row(s) removed, "
         f"{result.get('wrong_month_removed')} wrong-month row(s) removed, "
         f"{result.get('rows_unroutable')} row(s) had no readable date and were skipped."
     )

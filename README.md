@@ -17,7 +17,7 @@ different sheets, different Apps Script project, different secrets.
 | Schedule | **00:01, 06:01, 12:01, 18:01 America/Panama** (`1 5,11,17,23 * * *` UTC) + manual `workflow_dispatch` |
 | Target | Drive folder https://drive.google.com/drive/folders/1o6e1Q_zZj-Dpi8OSVnIs5kUcttGWZpEP - one file per month, `<M>_<YYYY>_CM_RD` (`8_2026_CM_RD`, `9_2026_CM_RD`, ...), first tab |
 | Routing | each row goes to the file matching **its own `date` column** - a run on 1 Sep that pulls 31 Aug + 1 Sep rows writes to `8_2026_CM_RD` **and** `9_2026_CM_RD` |
-| Dedupe | by `mission_sas_id`, last-posted row wins (freshest scrape) |
+| Dedupe | **upsert** by `mission_sas_id`: an id already in the file is overwritten in place, new ids are appended (freshest scrape wins, file never grows with duplicates) |
 | Cleanup | any row whose `date` is from a different month than the file it sits in is **deleted** |
 | Missing file | a month file that doesn't exist yet is created in the folder with the header row |
 
@@ -30,10 +30,12 @@ different sheets, different Apps Script project, different secrets.
    URL until it returns 200.
 2. It POSTs `{"rows": [[...35 cols...], ...]}` to the Apps Script Web App
    (`apps-script/Code.gs`) with `?token=`.
-3. The Web App groups rows by month (from column B `date`), appends each
-   group to its monthly file, then rebuilds every touched file plus the
-   current month's file in a single read/write pass: wrong-month rows out,
-   duplicate `mission_sas_id` rows collapsed to the last one.
+3. The Web App groups rows by month (from column B `date`) and upserts each
+   group into its monthly file (existing ids overwritten in place, new ids
+   appended), then runs a cleanup over columns A:B of every touched file
+   plus the current month's file: wrong-month rows and any stray duplicate
+   `mission_sas_id` rows are deleted. The cleanup only writes when it finds
+   something to remove.
 
 The browser-driving code is the hardened **v4.1** logic from the FedEx
 pipeline (see the module docstring for the list of Sisense traps it works
@@ -63,11 +65,12 @@ look for:
 ```
 Pulling 'Copa - Master Report' data for 09/02/2026 to 09/03/2026 (D-1 to D0, America/Panama)...
 Scraped 312 rows for 09/02/2026 to 09/03/2026.
-Posted 312 rows; 290 duplicate mission_sas_id row(s) removed, 0 wrong-month row(s) removed, 0 row(s) had no readable date and were skipped.
-  9_2026_CM_RD: {'rows_received': 312, 'duplicates_removed': 290, 'wrong_month_removed': 0, 'total_rows': 1180}
+Posted 312 rows: 290 updated in place, 22 appended; 0 stray duplicate row(s) removed, 0 wrong-month row(s) removed, 0 row(s) had no readable date and were skipped.
+  9_2026_CM_RD: {'rows_received': 312, 'rows_updated': 290, 'rows_appended': 22, 'duplicates_removed': 0, 'wrong_month_removed': 0, 'total_rows': 1180}
 ```
 
-Large duplicate counts are normal - every run re-posts the last two days.
+Large "updated in place" counts are normal - every run re-posts the last
+two days; "appended" is what is actually new since the previous run.
 A scrape step that finishes in single-digit seconds did not do the work.
 
 ## Admin actions (GET, token-gated)
@@ -89,6 +92,10 @@ A scrape step that finishes in single-digit seconds did not do the work.
   `restore_text` exists to undo the one file that was converted.
 - A green Actions check is not success: run #1 was green while posting 0
   usable rows. Read the per-file line.
+- **Don't rewrite the whole month every run.** v1-v3 appended everything
+  and then re-read/re-wrote the entire tab to dedupe - fine at 6k rows,
+  not at the ~25k rows a month reaches. v4 upserts by id and the cleanup
+  reads only columns A:B.
 
 ## Known edge cases
 
