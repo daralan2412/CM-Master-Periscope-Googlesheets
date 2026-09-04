@@ -1,0 +1,49 @@
+name: Pull Copa Master Report (Periscope) to monthly Google Sheets
+
+on:
+  schedule:
+    # Four times a day at 00:01, 06:01, 12:01, 18:01 America/Panama (PTY).
+    # Panama is UTC-5 all year (no DST), so the offset never drifts:
+    #   05:01 UTC = 00:01 Panama
+    - cron: '1 5 * * *'
+    #   11:01 UTC = 06:01 Panama
+    - cron: '1 11 * * *'
+    #   17:01 UTC = 12:01 Panama
+    - cron: '1 17 * * *'
+    #   23:01 UTC = 18:01 Panama
+    - cron: '1 23 * * *'
+    # NOTE: GitHub delays scheduled runs by minutes-to-hours on busy days.
+    # The scraper computes its D-1/D0 window at run time, so a late run
+    # still pulls the right days.
+  workflow_dispatch: {}
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run scrape and upload
+        env:
+          SHEETS_WEBAPP_URL: ${{ secrets.SHEETS_WEBAPP_URL }}
+          WEBAPP_TOKEN: ${{ secrets.WEBAPP_TOKEN }}
+        run: python scrape_and_upload.py
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: |
+            *.png
+            *.html
+          if-no-files-found: ignore
