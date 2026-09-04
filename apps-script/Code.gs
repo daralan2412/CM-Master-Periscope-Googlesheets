@@ -21,16 +21,17 @@
  *        09/01/2026 -> 9_2026_CM_RD - regardless of when the run happened.
  *        A monthly file that does not exist yet is created in the folder
  *        with the header row (so January 2027 needs no manual setup).
- *        After appending, every touched file (plus the current month's file)
- *        is rebuilt in one pass:
+ *        Rows are UPSERTED (v4): a mission_sas_id already in the file has
+ *        its row overwritten in place (freshest scrape wins), new ids are
+ *        appended - so re-posting D-1/D0 four times a day never grows the
+ *        file with duplicates. Then every touched file (plus the current
+ *        month's file) gets a cleanup pass over columns A:B only:
  *          1. rows whose "date" belongs to a DIFFERENT month/year than the
  *             file are DELETED (per instruction: "check if a mission from
  *             other month is in the wrong file and delete");
- *          2. duplicate mission_sas_id rows are collapsed to the LAST
- *             occurrence (most recently posted = freshest scrape).
- *        The rebuild reads the whole tab once and writes it back once
- *        (clearContents + setValues) instead of deleteRow() per row, which
- *        is far faster on the ~thousands-of-rows monthly files.
+ *          2. stray duplicate mission_sas_id rows (hand-pasted data) are
+ *             collapsed to the LAST occurrence.
+ *        The cleanup only writes when something has to be removed.
  *
  * Both endpoints require ?token=<AUTH_TOKEN> (Script Property, Project
  * Settings > Script Properties). Put the same value in the GitHub secret
@@ -118,23 +119,25 @@ function doPost(e) {
       (groups[ym] = groups[ym] || []).push(row);
     });
 
-    // 2. Append each group to its monthly file (creating the file if needed).
+    // 2. UPSERT each group into its monthly file (creating the file if
+    //    needed): a posted mission_sas_id that already exists in the file
+    //    overwrites its row in place (freshest scrape wins), everything else
+    //    is appended. This replaces the v1-v3 "append everything, then
+    //    rewrite the whole tab to dedupe" approach, which re-read and
+    //    re-wrote every cell of the month on every run (~900k cells by
+    //    month end - too slow for the scraper's HTTP timeout and Apps
+    //    Script's 6-minute cap).
     var touched = {};          // "9_2026" -> Sheet
     var perFile = {};          // "9_2026_CM_RD" -> stats
     Object.keys(groups).forEach(function (ym) {
       var sheet = getOrCreateMonthSheet_(folder, ym);
-      var batch = groups[ym];
-      var target = sheet.getRange(sheet.getLastRow() + 1, 1, batch.length, HEADERS.length);
-      // Force plain-text cells BEFORE writing. Without this, Sheets parses
-      // "09/03/2026" into a real Date using the spreadsheet's locale - and
-      // under a dd/mm locale that is 9 March, so the rebuild below then
-      // read the freshly appended rows as "3_2026" and deleted all 1721 of
-      // them as wrong-month (CI run #1, 2026-09-04). The existing rows in
-      // the monthly files are text, so this also keeps the files uniform.
-      target.setNumberFormat('@');
-      target.setValues(batch);
+      var u = upsertRows_(sheet, groups[ym]);
       touched[ym] = sheet;
-      perFile[ym + FILE_SUFFIX] = { rows_received: batch.length };
+      perFile[ym + FILE_SUFFIX] = {
+        rows_received: groups[ym].length,
+        rows_updated: u.updated,
+        rows_appended: u.appended
+      };
     });
 
     // 3. Always also check the current month's file (Panama time), so the
@@ -145,12 +148,15 @@ function doPost(e) {
       if (cur) touched[nowYm] = cur;
     }
 
-    // 4. Rebuild every touched file: drop wrong-month rows, dedupe by id.
+    // 4. Cleanup pass on every touched file: delete rows whose date belongs
+    //    to another month, and any duplicate mission_sas_id rows that were
+    //    not created by this pipeline (e.g. hand-pasted data). Reads only
+    //    columns A:B, and only rewrites when something has to go.
     var totalDupes = 0, totalWrongMonth = 0;
     Object.keys(touched).forEach(function (ym) {
       var r = rebuildSheet_(touched[ym], ym);
       var name = ym + FILE_SUFFIX;
-      perFile[name] = perFile[name] || { rows_received: 0 };
+      perFile[name] = perFile[name] || { rows_received: 0, rows_updated: 0, rows_appended: 0 };
       perFile[name].duplicates_removed = r.duplicates;
       perFile[name].wrong_month_removed = r.wrongMonth;
       perFile[name].total_rows = r.total;
@@ -158,10 +164,18 @@ function doPost(e) {
       totalWrongMonth += r.wrongMonth;
     });
 
+    var totalUpdated = 0, totalAppended = 0;
+    Object.keys(perFile).forEach(function (k) {
+      totalUpdated += perFile[k].rows_updated || 0;
+      totalAppended += perFile[k].rows_appended || 0;
+    });
+
     return jsonOut_({
       success: true,
       rows_received: rows.length,
       rows_unroutable: unroutable,
+      rows_updated: totalUpdated,
+      rows_appended: totalAppended,
       duplicates_removed: totalDupes,
       wrong_month_removed: totalWrongMonth,
       files: perFile
@@ -242,56 +256,136 @@ function firstDataSheet_(ss) {
 }
 
 // ---------------------------------------------------------------------------
-// Rebuild: remove wrong-month rows + duplicate mission_sas_id rows
+// Upsert: overwrite rows whose mission_sas_id already exists, append the rest
 // ---------------------------------------------------------------------------
 
+function upsertRows_(sheet, batch) {
+  var lastRow = sheet.getLastRow();
+
+  // Existing ids -> sheet row number (last occurrence wins if the file has
+  // stray duplicates; the cleanup pass removes those separately).
+  var rowById = {};
+  if (lastRow >= 2) {
+    var ids = sheet.getRange(2, MISSION_ID_COL, lastRow - 1, 1).getValues();
+    for (var i = 0; i < ids.length; i++) {
+      var id = String(ids[i][0]).trim();
+      if (id) rowById[id] = i + 2;
+    }
+  }
+
+  // Collapse the batch itself by id (last posted wins), then split into
+  // in-place updates and appends. Rows with a blank id are always appended.
+  var updates = {};      // sheet row number -> row values
+  var appendsById = {};  // id -> row values (dedupe within the batch)
+  var appendOrder = [];
+  var blankIdRows = [];
+  batch.forEach(function (row) {
+    var id = String(row[MISSION_ID_COL - 1]).trim();
+    if (!id) { blankIdRows.push(row); return; }
+    if (rowById[id]) { updates[rowById[id]] = row; return; }
+    if (!appendsById.hasOwnProperty(id)) appendOrder.push(id);
+    appendsById[id] = row;
+  });
+
+  // Write updates in contiguous blocks (rows of the same day were appended
+  // together by an earlier run, so a re-sync usually touches 1-3 blocks).
+  var rowNums = Object.keys(updates).map(Number).sort(function (a, b) { return a - b; });
+  var updated = 0;
+  var b = 0;
+  while (b < rowNums.length) {
+    var e = b;
+    while (e + 1 < rowNums.length && rowNums[e + 1] === rowNums[e] + 1) e++;
+    var block = [];
+    for (var r = b; r <= e; r++) block.push(updates[rowNums[r]]);
+    var rng = sheet.getRange(rowNums[b], 1, block.length, HEADERS.length);
+    rng.setNumberFormat('@'); // see doPost: text cells, never locale-parsed
+    rng.setValues(block);
+    updated += block.length;
+    b = e + 1;
+  }
+
+  var appends = appendOrder.map(function (id) { return appendsById[id]; }).concat(blankIdRows);
+  if (appends.length > 0) {
+    var target = sheet.getRange(lastRow + 1, 1, appends.length, HEADERS.length);
+    target.setNumberFormat('@');
+    target.setValues(appends);
+  }
+  return { updated: updated, appended: appends.length };
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup: remove wrong-month rows + stray duplicate mission_sas_id rows
+// ---------------------------------------------------------------------------
+
+// Scans only columns A:B. When nothing has to be removed (the normal case
+// now that doPost upserts) it returns without touching the sheet. When rows
+// must go, it deletes them in contiguous blocks from the bottom up, or - if
+// they are scattered across many blocks - falls back to one full rewrite.
 function rebuildSheet_(sheet, ym) {
   var lastRow = sheet.getLastRow();
   var lastCol = Math.max(sheet.getLastColumn(), HEADERS.length);
   if (lastRow < 2) return { duplicates: 0, wrongMonth: 0, total: 0 };
 
-  var data = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  var ab = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
 
-  // Pass 1: drop rows whose own date says they belong to another month's
-  // file. Rows with an unreadable/blank date are kept (never guess).
+  // Wrong-month rows first, so a stray row from another month can never
+  // "win" the duplicate check against a legitimate in-month row.
+  var wrong = {};
   var wrongMonth = 0;
-  var inMonth = [];
-  for (var i = 0; i < data.length; i++) {
-    var key = monthKeyFromCell_(data[i][DATE_COL - 1]);
-    if (key && key !== ym) { wrongMonth++; continue; }
-    inMonth.push(data[i]);
+  for (var w = 0; w < ab.length; w++) {
+    var key = monthKeyFromCell_(ab[w][1]);
+    if (key && key !== ym) { wrong[w] = true; wrongMonth++; }
   }
 
-  // Pass 2: keep the LAST occurrence of each non-blank mission_sas_id.
   var lastIndexById = {};
-  for (var j = 0; j < inMonth.length; j++) {
-    var id = String(inMonth[j][MISSION_ID_COL - 1]).trim();
+  for (var j = 0; j < ab.length; j++) {
+    if (wrong[j]) continue;
+    var id = String(ab[j][0]).trim();
     if (id) lastIndexById[id] = j;
   }
-  var kept = [];
+
+  var toDelete = [];   // 0-based indexes into ab
   var duplicates = 0;
-  for (var k = 0; k < inMonth.length; k++) {
-    var idK = String(inMonth[k][MISSION_ID_COL - 1]).trim();
-    if (idK && lastIndexById[idK] !== k) { duplicates++; continue; }
-    kept.push(inMonth[k]);
+  for (var i = 0; i < ab.length; i++) {
+    if (wrong[i]) { toDelete.push(i); continue; }
+    var idI = String(ab[i][0]).trim();
+    if (idI && lastIndexById[idI] !== i) { duplicates++; toDelete.push(i); }
   }
 
-  // Skip entirely-blank rows that can sit under the data.
-  kept = kept.filter(function (r) {
-    return r.some(function (c) { return c !== '' && c !== null; });
-  });
+  var total = ab.length - toDelete.length;
+  if (toDelete.length === 0) return { duplicates: 0, wrongMonth: 0, total: total };
 
-  var removed = data.length - kept.length;
-  if (removed > 0) {
-    var whole = sheet.getRange(2, 1, lastRow - 1, lastCol);
-    whole.clearContent();
+  // Group into contiguous blocks.
+  var blocks = [];
+  for (var k = 0; k < toDelete.length; k++) {
+    if (blocks.length && toDelete[k] === blocks[blocks.length - 1].end + 1) {
+      blocks[blocks.length - 1].end = toDelete[k];
+    } else {
+      blocks.push({ start: toDelete[k], end: toDelete[k] });
+    }
+  }
+
+  if (blocks.length <= 50) {
+    // Bottom-up so earlier row numbers stay valid.
+    for (var bi = blocks.length - 1; bi >= 0; bi--) {
+      sheet.deleteRows(blocks[bi].start + 2, blocks[bi].end - blocks[bi].start + 1);
+    }
+  } else {
+    // Many scattered rows: one read + one write is cheaper than hundreds of
+    // deleteRows calls.
+    var data = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+    var drop = {};
+    toDelete.forEach(function (x) { drop[x] = true; });
+    var kept = [];
+    for (var d = 0; d < data.length; d++) if (!drop[d]) kept.push(data[d]);
+    sheet.getRange(2, 1, lastRow - 1, lastCol).clearContent();
     if (kept.length > 0) {
       var dest = sheet.getRange(2, 1, kept.length, lastCol);
-      dest.setNumberFormat('@'); // keep text as text when rows shift upward
+      dest.setNumberFormat('@');
       dest.setValues(kept);
     }
   }
-  return { duplicates: duplicates, wrongMonth: wrongMonth, total: kept.length };
+  return { duplicates: duplicates, wrongMonth: wrongMonth, total: total };
 }
 
 // ---------------------------------------------------------------------------
