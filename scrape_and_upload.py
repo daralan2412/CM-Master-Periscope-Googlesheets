@@ -62,7 +62,15 @@ from playwright.sync_api import sync_playwright
 
 PERISCOPE_URL = "https://app.periscopedata.com/shared/c9658b54-aaa9-43a7-afa7-de6f6c3242bb"
 LOCAL_TZ = ZoneInfo("America/Panama")  # PTY station time; UTC-5 all year (no DST).
-LOOKBACK_DAYS = 1  # "D0 to D-1": yesterday and today, inclusive.
+# Window = today back through LOOKBACK_DAYS days ago, inclusive.
+# Spec was "D0 to D-1", but the source lags: on 2026-09-04 the report had ZERO
+# rows dated 09/04 at 08:55 Panama (explicit 09/04-09/04 filter -> "Query
+# returned no matching rows"), while rows dated 09/03 were still being added
+# 8+ hours into 09/04 (1721 at 01:19 -> 2122 at 08:10). So D0 is usually
+# empty and D-1 keeps filling up during D0. Pulling D-2 as well costs nothing
+# (the Web App upserts, so re-posting known ids just refreshes them) and
+# guarantees every day is re-synced ~12 times after it ends.
+LOOKBACK_DAYS = 2  # "D0 to D-2": today, yesterday and the day before, inclusive.
 SCRAPE_ATTEMPTS = 3  # whole-scrape retries with a fresh browser (see main()).
 SCRAPE_RETRY_DELAY_S = 60
 WEBAPP_URL = os.environ["SHEETS_WEBAPP_URL"]
@@ -100,7 +108,7 @@ def check_token():
 
 
 def compute_date_range_mmddyyyy():
-    """D0 to D-1: today (America/Panama) and today minus LOOKBACK_DAYS, both
+    """D0 to D-LOOKBACK_DAYS: today (America/Panama) and today minus LOOKBACK_DAYS, both
     formatted MM/DD/YYYY for Periscope's Custom Range Start/End Date inputs.
     Computed fresh on every call so the window is always "as of right now",
     not pinned to whatever day the code was last edited.
@@ -431,7 +439,7 @@ def main():
     check_token()
 
     start_str, end_str = compute_date_range_mmddyyyy()
-    print(f"Pulling 'Copa - Master Report' data for {start_str} to {end_str} (D-1 to D0, America/Panama)...")
+    print(f"Pulling 'Copa - Master Report' data for {start_str} to {end_str} (D-{LOOKBACK_DAYS} to D0, America/Panama)...")
 
     # Whole-scrape retry with a fresh browser. Every failure seen on the
     # scheduled runs so far has been Sisense being slow/unresponsive at

@@ -13,7 +13,7 @@ different sheets, different Apps Script project, different secrets.
 | | |
 |---|---|
 | Source | https://app.periscopedata.com/shared/c9658b54-aaa9-43a7-afa7-de6f6c3242bb (widget "Data", 35 columns) |
-| Window | **D0 to D-1**: yesterday and today, America/Panama, computed fresh on every run |
+| Window | **D0 to D-2**: today, yesterday and the day before (America/Panama), computed fresh on every run. Spec was D0-D-1; widened because the source lags (see below) |
 | Schedule | **00:01, 06:01, 12:01, 18:01 America/Panama** (`1 5,11,17,23 * * *` UTC) + manual `workflow_dispatch` |
 | Target | Drive folder https://drive.google.com/drive/folders/1o6e1Q_zZj-Dpi8OSVnIs5kUcttGWZpEP - one file per month, `<M>_<YYYY>_CM_RD` (`8_2026_CM_RD`, `9_2026_CM_RD`, ...), first tab |
 | Routing | each row goes to the file matching **its own `date` column** - a run on 1 Sep that pulls 31 Aug + 1 Sep rows writes to `8_2026_CM_RD` **and** `9_2026_CM_RD` |
@@ -96,6 +96,19 @@ A scrape step that finishes in single-digit seconds did not do the work.
   and then re-read/re-wrote the entire tab to dedupe - fine at 6k rows,
   not at the ~25k rows a month reaches. v4 upserts by id and the cleanup
   reads only columns A:B.
+
+## Why "today" is usually empty
+
+The Periscope report does **not** have same-day rows: on 2026-09-04 at 08:55
+Panama an explicit `09/04-09/04` filter returned "Query returned no matching
+rows", and rows dated 09/03 were still being added 8+ hours into 09/04
+(1721 at 01:19, 2122 at 08:10). The source loads with a lag of hours (and
+may simply exclude the current day). So:
+
+- the file for a day fills up during the *following* day;
+- each run re-pulls D-2..D0 and the Web App upserts, so late rows are picked
+  up by the next run at no cost;
+- `rows_appended` in the log is the real "new since last run" number.
 
 ## Known edge cases
 
