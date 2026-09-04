@@ -70,6 +70,26 @@ Posted 312 rows; 290 duplicate mission_sas_id row(s) removed, 0 wrong-month row(
 Large duplicate counts are normal - every run re-posts the last two days.
 A scrape step that finishes in single-digit seconds did not do the work.
 
+## Admin actions (GET, token-gated)
+
+- `?token=...` - health check.
+- `?token=...&action=rebuild&file=9_2026_CM_RD` - run the dedupe +
+  wrong-month cleanup on one file without posting anything.
+- `?token=...&action=restore_text&file=9_2026_CM_RD` - one-off repair that
+  turns any Date/number cells back into the text form (`MM/dd/yyyy`,
+  `MM/dd/yyyy HH:mm`) and marks the data range as plain text.
+
+## Lessons from the first runs (2026-09-04)
+
+- **Write cells as plain text.** `setValues()` on automatic-format cells
+  lets Sheets parse `09/03/2026` as a Date using the spreadsheet's locale
+  (these files are `America/Los_Angeles` / dd-mm style), so run #1 saw all
+  1721 fresh rows as March and deleted them as wrong-month. The Web App now
+  calls `setNumberFormat('@')` on a range before every `setValues()`, and
+  `restore_text` exists to undo the one file that was converted.
+- A green Actions check is not success: run #1 was green while posting 0
+  usable rows. Read the per-file line.
+
 ## Known edge cases
 
 - Around midnight Panama time the window still covers both days, so a
