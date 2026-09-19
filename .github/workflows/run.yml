@@ -2,19 +2,26 @@ name: Pull Copa Master Report (Periscope) to monthly Google Sheets
 
 on:
   schedule:
-    # Four times a day at 00:01, 06:01, 12:01, 18:01 America/Panama (PTY).
+    # Four times a day at 00:07, 06:07, 12:07, 18:07 America/Panama (PTY).
     # Panama is UTC-5 all year (no DST), so the offset never drifts:
-    #   05:01 UTC = 00:01 Panama
-    - cron: '1 5 * * *'
-    #   11:01 UTC = 06:01 Panama
-    - cron: '1 11 * * *'
-    #   17:01 UTC = 12:01 Panama
-    - cron: '1 17 * * *'
-    #   23:01 UTC = 18:01 Panama
-    - cron: '1 23 * * *'
-    # NOTE: GitHub delays scheduled runs by minutes-to-hours on busy days.
-    # The scraper computes its D-1/D0 window at run time, so a late run
-    # still pulls the right days.
+    #   05:07 UTC = 00:07 Panama
+    - cron: '7 5 * * *'
+    #   11:07 UTC = 06:07 Panama
+    - cron: '7 11 * * *'
+    #   17:07 UTC = 12:07 Panama
+    - cron: '7 17 * * *'
+    #   23:07 UTC = 18:07 Panama
+    - cron: '7 23 * * *'
+    # WHY :07 AND NOT :01 - GitHub queues scheduled workflows behind
+    # everything else that is scheduled at the same minute, and "the start
+    # of every hour" is its documented peak (docs: "The schedule event can
+    # be delayed during periods of high loads ... High load times include
+    # the start of every hour"). With ':1' the runs of 2026-09-04..09-18
+    # regularly started 2-4 HOURS late (e.g. the 18:01 slot at 20:06), which
+    # looked like the pipeline was stuck. An off-peak minute keeps the same
+    # 4x/day cadence while avoiding that queue.
+    # The scraper computes its D-2..D0 window at run time, so even a late
+    # run still pulls the right days, and every day is re-synced ~12 times.
   workflow_dispatch: {}
 
 jobs:
