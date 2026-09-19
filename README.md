@@ -44,7 +44,7 @@ wrong breadcrumb selector, slow default "All Dates" query at scheduled hours).
 
 ## Files
 
-- `scrape_and_upload.py` - the scraper (v1.3, 2026-09-19).
+- `scrape_and_upload.py` - the scraper (v1.4, 2026-09-19).
 - `.github/workflows/run.yml` - schedule + manual trigger; uploads
   `debug_failure.png/.html` as artifacts when a run fails.
 - `apps-script/Code.gs`, `apps-script/appsscript.json` - the Web App
@@ -70,7 +70,7 @@ Posted 312 rows: 290 updated in place, 22 appended; 0 stray duplicate row(s) rem
 ```
 
 Large "updated in place" counts are normal - every run re-posts the last
-two days; "appended" is what is actually new since the previous run.
+three days; "appended" is what is actually new since the previous run.
 A scrape step that finishes in single-digit seconds did not do the work.
 
 ## Admin actions (GET, token-gated)
@@ -118,17 +118,22 @@ may simply exclude the current day). So:
   routinely started 2-4 hours late (the 18:01 slot at 20:06), which made
   the pipeline look stuck. The crons now fire at :07. A late run still
   pulls the right days because the window is computed at run time.
-- **A red run is not necessarily lost data.** Run #64 (2026-09-19 01:06
-  UTC) scraped 6,505 rows and the Web App wrote them (the sheet's modified
-  time proves it), but the step exited 1 with `404 Client Error: Not Found
-  for url: https://script.googleusercontent.com/macros/echo?...` - Apps
-  Script hands its JSON reply back through a one-time googleusercontent
-  redirect, and Google occasionally loses it. `post_rows` now retries transient
-  replies (404 on the googleusercontent "echo" reply URL - run #64's exact error -
-  5xx/429, connection errors, timeouts, non-JSON bodies, the Web
-  App's lock-timeout message) up to 4 times, 45 s apart. Re-posting is safe
-  because the Web App upserts by `mission_sas_id`. Token/4xx errors and an
-  explicit `success:false` from `doPost` are still fatal, on purpose.
+- **Google intermittently 404s the Web App's reply.** Apps Script answers
+  through a 302 to a one-time `script.googleusercontent.com/macros/echo?...`
+  URL, and 3 of the 4 scheduled runs on 2026-09-18/19 (#61, #62, #64) died
+  with `404 Client Error: Not Found for url: https://script.googleusercontent.com/macros/echo?...`.
+  #61/#62 failed on the tiny health-check GET before scraping; #64 failed
+  on the POST *after* the Web App had already written all 6,505 rows (the
+  sheet's modified time proves it). 12 back-to-back GETs from another
+  machine all returned 200 - it is a transient, not a broken deployment.
+  Every Web App call now goes through `webapp_request()`, which retries
+  404/408/429/5xx, connection errors, timeouts, non-JSON bodies and the
+  Web App's lock-timeout message up to 4 times, 45 s apart. Re-posting is
+  safe because the Web App upserts by `mission_sas_id`. A 401/403, any
+  other 4xx, or an explicit `success:false` from `doGet`/`doPost` is still
+  fatal on purpose - those need a human.
+- **A red run is not necessarily lost data**, and a missed run is never
+  lost data: every run re-pulls D-2..D0, so the next green run backfills.
 - The scraper can be run from any machine with Python 3.11 + Playwright
   (`SHEETS_WEBAPP_URL` / `WEBAPP_TOKEN` in the environment) - that is how
   the 2026-09-19 manual catch-up was done while GitHub logs were

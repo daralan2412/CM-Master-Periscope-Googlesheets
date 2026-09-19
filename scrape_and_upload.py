@@ -94,17 +94,81 @@ HEADERS = [
 ]
 
 
+WEBAPP_ATTEMPTS = 4
+WEBAPP_RETRY_DELAY_S = 45
+
+
+class PermanentWebAppError(RuntimeError):
+    """The Web App answered in a way a retry cannot fix (bad token, doPost error)."""
+
+
+def webapp_request(method: str, timeout: int, **kwargs) -> dict:
+    """GET/POST the Apps Script Web App and return its JSON, retrying transients.
+
+    WHY THIS EXISTS. Three of the four scheduled runs of 2026-09-18/19
+    (#61, #62, #64) went red with exactly this:
+        FAILED: 404 Client Error: Not Found for url:
+        https://script.googleusercontent.com/macros/echo?user_content_key=...
+    Apps Script does not answer on the /exec URL itself - it 302-redirects
+    to a one-time googleusercontent "echo" URL that carries the reply, and
+    Google intermittently 404s that redirect. #61 and #62 died on the
+    tiny health-check GET before scraping anything; #64 died on the POST
+    *after* the Web App had already written all 6,505 rows (the sheet's
+    modified time matches). Twelve back-to-back GETs from another machine
+    all returned 200, so it is a transient, not a broken deployment.
+
+    Both calls are safe to repeat: the GET is read-only and the POST is an
+    upsert by mission_sas_id, so a retry after an ambiguous failure can at
+    worst rewrite identical rows.
+
+    Retryable: connection errors, timeouts, HTTP 5xx / 429 / 408 / 404, a
+    non-JSON body, and the Web App's own "another upload is in progress"
+    lock timeout. Not retryable (raised as PermanentWebAppError): 401/403
+    and any other 4xx, and an explicit success:false from doGet/doPost.
+    """
+    last_err = None
+    for attempt in range(1, WEBAPP_ATTEMPTS + 1):
+        try:
+            resp = requests.request(
+                method, WEBAPP_URL, params={"token": WEBAPP_TOKEN}, timeout=timeout, **kwargs
+            )
+            if resp.status_code >= 500 or resp.status_code in (404, 408, 429):
+                raise RuntimeError(
+                    f"HTTP {resp.status_code} from Web App ({resp.url[:60]}...): {resp.text[:160]!r}"
+                )
+            if resp.status_code >= 400:
+                raise PermanentWebAppError(
+                    f"Web App {method} rejected with HTTP {resp.status_code}: {resp.text[:160]!r}"
+                )
+            try:
+                data = resp.json()
+            except ValueError:
+                raise RuntimeError(f"non-JSON reply from Web App (HTTP {resp.status_code}): {resp.text[:160]!r}")
+            if not data.get("success"):
+                err = str(data.get("error", ""))
+                if "lock timeout" in err or "in progress" in err:
+                    raise RuntimeError(f"Web App busy: {err}")
+                raise PermanentWebAppError(f"Web App {method} failed: {data}")
+            return data
+        except PermanentWebAppError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the transient classes listed above
+            last_err = exc
+            print(f"Web App {method} attempt {attempt}/{WEBAPP_ATTEMPTS} failed: {exc}", file=sys.stderr)
+            if attempt < WEBAPP_ATTEMPTS:
+                print(f"Retrying in {WEBAPP_RETRY_DELAY_S}s...", file=sys.stderr)
+                time.sleep(WEBAPP_RETRY_DELAY_S)
+    raise RuntimeError(f"Web App {method} failed after {WEBAPP_ATTEMPTS} attempts: {last_err}")
+
+
 def check_token():
     """Cheap pre-flight auth check before paying for a headless-browser scrape.
 
     doGet() no longer decides what to pull (there's no watermark anymore),
-    it's just a token/connectivity health check now.
+    it's just a token/connectivity health check now. Retried like the POST
+    (see webapp_request): runs #61/#62 died right here on the echo-URL 404.
     """
-    resp = requests.get(WEBAPP_URL, params={"token": WEBAPP_TOKEN}, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"Web App auth check failed: {data}")
+    webapp_request("GET", timeout=30)
 
 
 def compute_date_range_mmddyyyy():
@@ -417,83 +481,19 @@ def parse_csv_rows(csv_text: str):
     return rows
 
 
-POST_ATTEMPTS = 4
-POST_RETRY_DELAY_S = 45
-
-
-class PermanentPostError(RuntimeError):
-    """doPost answered success:false for a reason a retry cannot fix."""
-
-
 def post_rows(rows: list):
-    """POST the scraped rows to the Web App, retrying transient failures.
-
-    The Web App upserts by mission_sas_id, so re-posting the same batch is
-    idempotent - which makes retrying safe even when we cannot tell whether
-    the first attempt actually reached the sheet. This matters because
-    scheduled run #64 (2026-09-19 01:06 UTC) scraped fine and the Web App
-    DID write the rows (the sheet's modified time matches), yet the step
-    still exited 1 with "404 Client Error: Not Found for url:
-    https://script.googleusercontent.com/macros/echo?user_content_key=...":
-    Apps Script replies through a redirect to a one-time googleusercontent
-    'echo' URL, and Google occasionally loses that reply. One failed attempt
-    out of ~60 is a transient, and a transient must not turn a green
-    pipeline red or skip a 6-hour window.
-
-    Retryable: connection errors, timeouts, HTTP 5xx/429/408/404, a non-JSON
-    body, and the Web App's own "another upload is in progress" lock timeout.
-    Not retryable: 4xx auth/token errors and any explicit success:false
-    from doPost (those need a human).
+    """POST the scraped rows to the Web App (retried, see webapp_request).
 
     Generous timeout: the Web App upserts into a month file that grows to
     ~40k rows; Apps Script's own hard limit is 6 minutes, so wait for it
     rather than declaring failure while it is still writing.
     """
-    payload = json.dumps({"rows": rows})
-    last_err = None
-    for attempt in range(1, POST_ATTEMPTS + 1):
-        try:
-            resp = requests.post(
-                WEBAPP_URL,
-                params={"token": WEBAPP_TOKEN},
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=360,
-            )
-            if resp.status_code >= 500 or resp.status_code in (404, 408, 429):
-                # 404 is on the list deliberately: run #64's exact failure was
-                # "404 Client Error: Not Found for url:
-                # https://script.googleusercontent.com/macros/echo?user_content_key=..."
-                # - Apps Script had already finished and written the rows, but
-                # the redirect to the one-time 'echo' URL that carries the JSON
-                # reply 404'd. check_token() has already proven the /exec URL
-                # itself resolves, so a 404 here is Google losing the reply,
-                # not a wrong deployment URL.
-                raise RuntimeError(f"HTTP {resp.status_code} from Web App: {resp.text[:200]!r}")
-            resp.raise_for_status()  # 401/403/other 4xx: not transient, surfaces below
-            try:
-                data = resp.json()
-            except ValueError:
-                raise RuntimeError(f"non-JSON reply from Web App (HTTP {resp.status_code}): {resp.text[:200]!r}")
-            if not data.get("success"):
-                err = str(data.get("error", ""))
-                if "lock timeout" in err or "in progress" in err:
-                    raise RuntimeError(f"Web App busy: {err}")
-                raise PermanentPostError(f"Web App POST failed: {data}")
-            return data
-        except PermanentPostError:
-            raise
-        except requests.HTTPError as exc:
-            # 4xx other than 429 - bad token / bad deployment, retrying won't help
-            raise RuntimeError(f"Web App POST rejected: {exc}") from exc
-        except Exception as exc:  # noqa: BLE001 - transient classes listed above
-            last_err = exc
-            print(f"POST attempt {attempt}/{POST_ATTEMPTS} failed: {exc}", file=sys.stderr)
-            if attempt < POST_ATTEMPTS:
-                print(f"Retrying POST in {POST_RETRY_DELAY_S}s (upsert is idempotent)...", file=sys.stderr)
-                time.sleep(POST_RETRY_DELAY_S)
-    raise RuntimeError(f"Web App POST failed after {POST_ATTEMPTS} attempts: {last_err}")
-
+    return webapp_request(
+        "POST",
+        timeout=360,
+        data=json.dumps({"rows": rows}),
+        headers={"Content-Type": "application/json"},
+    )
 
 
 def main():
