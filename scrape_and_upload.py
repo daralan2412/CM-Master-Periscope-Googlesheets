@@ -18,7 +18,7 @@ Target: one Google Sheet per month in Drive folder
         2026-09-01 that pulls 08/31 and 09/01 rows lands them in 8_2026_CM_RD
         and 9_2026_CM_RD respectively.
 
-Flow (runs 4x a day: 00:01, 06:01, 12:01, 18:01 America/Panama):
+Flow (runs 4x a day: 00:07, 06:07, 12:07, 18:07 America/Panama - see run.yml):
   1. Open the report, set the Date Range filter to a rolling "D0 to D-1"
      window (yesterday through today, America/Panama) via Custom Range with
      computed Start/End dates, then use the Data widget's own "Download Data"
@@ -417,22 +417,83 @@ def parse_csv_rows(csv_text: str):
     return rows
 
 
+POST_ATTEMPTS = 4
+POST_RETRY_DELAY_S = 45
+
+
+class PermanentPostError(RuntimeError):
+    """doPost answered success:false for a reason a retry cannot fix."""
+
+
 def post_rows(rows: list):
-    # Generous timeout: the Web App upserts into a month file that grows to
-    # ~25k rows; Apps Script's own hard limit is 6 minutes, so wait for it
-    # rather than declaring failure while it is still writing.
-    resp = requests.post(
-        WEBAPP_URL,
-        params={"token": WEBAPP_TOKEN},
-        data=json.dumps({"rows": rows}),
-        headers={"Content-Type": "application/json"},
-        timeout=360,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"Web App POST failed: {data}")
-    return data
+    """POST the scraped rows to the Web App, retrying transient failures.
+
+    The Web App upserts by mission_sas_id, so re-posting the same batch is
+    idempotent - which makes retrying safe even when we cannot tell whether
+    the first attempt actually reached the sheet. This matters because
+    scheduled run #64 (2026-09-19 01:06 UTC) scraped fine and the Web App
+    DID write the rows (the sheet's modified time matches), yet the step
+    still exited 1 with "404 Client Error: Not Found for url:
+    https://script.googleusercontent.com/macros/echo?user_content_key=...":
+    Apps Script replies through a redirect to a one-time googleusercontent
+    'echo' URL, and Google occasionally loses that reply. One failed attempt
+    out of ~60 is a transient, and a transient must not turn a green
+    pipeline red or skip a 6-hour window.
+
+    Retryable: connection errors, timeouts, HTTP 5xx/429/408/404, a non-JSON
+    body, and the Web App's own "another upload is in progress" lock timeout.
+    Not retryable: 4xx auth/token errors and any explicit success:false
+    from doPost (those need a human).
+
+    Generous timeout: the Web App upserts into a month file that grows to
+    ~40k rows; Apps Script's own hard limit is 6 minutes, so wait for it
+    rather than declaring failure while it is still writing.
+    """
+    payload = json.dumps({"rows": rows})
+    last_err = None
+    for attempt in range(1, POST_ATTEMPTS + 1):
+        try:
+            resp = requests.post(
+                WEBAPP_URL,
+                params={"token": WEBAPP_TOKEN},
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=360,
+            )
+            if resp.status_code >= 500 or resp.status_code in (404, 408, 429):
+                # 404 is on the list deliberately: run #64's exact failure was
+                # "404 Client Error: Not Found for url:
+                # https://script.googleusercontent.com/macros/echo?user_content_key=..."
+                # - Apps Script had already finished and written the rows, but
+                # the redirect to the one-time 'echo' URL that carries the JSON
+                # reply 404'd. check_token() has already proven the /exec URL
+                # itself resolves, so a 404 here is Google losing the reply,
+                # not a wrong deployment URL.
+                raise RuntimeError(f"HTTP {resp.status_code} from Web App: {resp.text[:200]!r}")
+            resp.raise_for_status()  # 401/403/other 4xx: not transient, surfaces below
+            try:
+                data = resp.json()
+            except ValueError:
+                raise RuntimeError(f"non-JSON reply from Web App (HTTP {resp.status_code}): {resp.text[:200]!r}")
+            if not data.get("success"):
+                err = str(data.get("error", ""))
+                if "lock timeout" in err or "in progress" in err:
+                    raise RuntimeError(f"Web App busy: {err}")
+                raise PermanentPostError(f"Web App POST failed: {data}")
+            return data
+        except PermanentPostError:
+            raise
+        except requests.HTTPError as exc:
+            # 4xx other than 429 - bad token / bad deployment, retrying won't help
+            raise RuntimeError(f"Web App POST rejected: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - transient classes listed above
+            last_err = exc
+            print(f"POST attempt {attempt}/{POST_ATTEMPTS} failed: {exc}", file=sys.stderr)
+            if attempt < POST_ATTEMPTS:
+                print(f"Retrying POST in {POST_RETRY_DELAY_S}s (upsert is idempotent)...", file=sys.stderr)
+                time.sleep(POST_RETRY_DELAY_S)
+    raise RuntimeError(f"Web App POST failed after {POST_ATTEMPTS} attempts: {last_err}")
+
 
 
 def main():

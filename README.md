@@ -14,7 +14,7 @@ different sheets, different Apps Script project, different secrets.
 |---|---|
 | Source | https://app.periscopedata.com/shared/c9658b54-aaa9-43a7-afa7-de6f6c3242bb (widget "Data", 35 columns) |
 | Window | **D0 to D-2**: today, yesterday and the day before (America/Panama), computed fresh on every run. Spec was D0-D-1; widened because the source lags (see below) |
-| Schedule | **00:01, 06:01, 12:01, 18:01 America/Panama** (`1 5,11,17,23 * * *` UTC) + manual `workflow_dispatch` |
+| Schedule | **00:07, 06:07, 12:07, 18:07 America/Panama** (`7 5,11,17,23 * * *` UTC) + manual `workflow_dispatch`. Was :01; moved off the top of the hour on 2026-09-19 because GitHub was starting those runs 2-4 h late (see below) |
 | Target | Drive folder https://drive.google.com/drive/folders/1o6e1Q_zZj-Dpi8OSVnIs5kUcttGWZpEP - one file per month, `<M>_<YYYY>_CM_RD` (`8_2026_CM_RD`, `9_2026_CM_RD`, ...), first tab |
 | Routing | each row goes to the file matching **its own `date` column** - a run on 1 Sep that pulls 31 Aug + 1 Sep rows writes to `8_2026_CM_RD` **and** `9_2026_CM_RD` |
 | Dedupe | **upsert** by `mission_sas_id`: an id already in the file is overwritten in place, new ids are appended (freshest scrape wins, file never grows with duplicates) |
@@ -44,7 +44,7 @@ wrong breadcrumb selector, slow default "All Dates" query at scheduled hours).
 
 ## Files
 
-- `scrape_and_upload.py` - the scraper (v1, 2026-09-03).
+- `scrape_and_upload.py` - the scraper (v1.3, 2026-09-19).
 - `.github/workflows/run.yml` - schedule + manual trigger; uploads
   `debug_failure.png/.html` as artifacts when a run fails.
 - `apps-script/Code.gs`, `apps-script/appsscript.json` - the Web App
@@ -63,7 +63,7 @@ widget genuinely has no rows). Open the "Run scrape and upload" step and
 look for:
 
 ```
-Pulling 'Copa - Master Report' data for 09/02/2026 to 09/03/2026 (D-1 to D0, America/Panama)...
+Pulling 'Copa - Master Report' data for 09/16/2026 to 09/18/2026 (D-2 to D0, America/Panama)...
 Scraped 312 rows for 09/02/2026 to 09/03/2026.
 Posted 312 rows: 290 updated in place, 22 appended; 0 stray duplicate row(s) removed, 0 wrong-month row(s) removed, 0 row(s) had no readable date and were skipped.
   9_2026_CM_RD: {'rows_received': 312, 'rows_updated': 290, 'rows_appended': 22, 'duplicates_removed': 0, 'wrong_month_removed': 0, 'total_rows': 1180}
@@ -109,6 +109,30 @@ may simply exclude the current day). So:
 - each run re-pulls D-2..D0 and the Web App upserts, so late rows are picked
   up by the next run at no cost;
 - `rows_appended` in the log is the real "new since last run" number.
+
+## Lessons from the first two weeks (2026-09-19)
+
+- **Scheduled runs at :01 start hours late.** GitHub queues `schedule`
+  events behind everything else scheduled at that minute and documents the
+  start of every hour as its peak; between 09-04 and 09-18 the :01 slots
+  routinely started 2-4 hours late (the 18:01 slot at 20:06), which made
+  the pipeline look stuck. The crons now fire at :07. A late run still
+  pulls the right days because the window is computed at run time.
+- **A red run is not necessarily lost data.** Run #64 (2026-09-19 01:06
+  UTC) scraped 6,505 rows and the Web App wrote them (the sheet's modified
+  time proves it), but the step exited 1 with `404 Client Error: Not Found
+  for url: https://script.googleusercontent.com/macros/echo?...` - Apps
+  Script hands its JSON reply back through a one-time googleusercontent
+  redirect, and Google occasionally loses it. `post_rows` now retries transient
+  replies (404 on the googleusercontent "echo" reply URL - run #64's exact error -
+  5xx/429, connection errors, timeouts, non-JSON bodies, the Web
+  App's lock-timeout message) up to 4 times, 45 s apart. Re-posting is safe
+  because the Web App upserts by `mission_sas_id`. Token/4xx errors and an
+  explicit `success:false` from `doPost` are still fatal, on purpose.
+- The scraper can be run from any machine with Python 3.11 + Playwright
+  (`SHEETS_WEBAPP_URL` / `WEBAPP_TOKEN` in the environment) - that is how
+  the 2026-09-19 manual catch-up was done while GitHub logs were
+  unreachable; it does exactly what a scheduled run does.
 
 ## Known edge cases
 
