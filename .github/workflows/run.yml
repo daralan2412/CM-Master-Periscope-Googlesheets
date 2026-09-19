@@ -22,7 +22,16 @@ on:
     # 4x/day cadence while avoiding that queue.
     # The scraper computes its D-2..D0 window at run time, so even a late
     # run still pulls the right days, and every day is re-synced ~12 times.
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      backfill_start:
+        description: 'Optional one-off catch-up: first day to re-pull (MM/DD/YYYY)'
+        required: false
+        default: ''
+      backfill_end:
+        description: 'Optional one-off catch-up: last day to re-pull (MM/DD/YYYY)'
+        required: false
+        default: ''
 
 jobs:
   scrape:
@@ -43,6 +52,9 @@ jobs:
         env:
           SHEETS_WEBAPP_URL: ${{ secrets.SHEETS_WEBAPP_URL }}
           WEBAPP_TOKEN: ${{ secrets.WEBAPP_TOKEN }}
+          # Empty on scheduled runs -> the scraper uses its rotating backfill chunk.
+          BACKFILL_START: ${{ github.event.inputs.backfill_start }}
+          BACKFILL_END: ${{ github.event.inputs.backfill_end }}
         run: python scrape_and_upload.py
 
       - name: Upload debug artifacts on failure
