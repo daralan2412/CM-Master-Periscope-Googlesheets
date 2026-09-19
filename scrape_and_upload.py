@@ -19,8 +19,8 @@ Target: one Google Sheet per month in Drive folder
         and 9_2026_CM_RD respectively.
 
 Flow (runs 4x a day: 00:07, 06:07, 12:07, 18:07 America/Panama - see run.yml):
-  1. Open the report, set the Date Range filter to a rolling "D0 to D-1"
-     window (yesterday through today, America/Panama) via Custom Range with
+  1. Open the report, set the Date Range filter to a rolling "D-2 to D0"
+     window (plus one older 3-day backfill chunk, see BACKFILL_*) via Custom Range with
      computed Start/End dates, then use the Data widget's own "Download Data"
      CSV export (NOT DOM scraping - the grid is virtualized, only the rows
      and columns near the viewport exist in the DOM; the CSV is generated
@@ -62,7 +62,7 @@ from playwright.sync_api import sync_playwright
 
 PERISCOPE_URL = "https://app.periscopedata.com/shared/c9658b54-aaa9-43a7-afa7-de6f6c3242bb"
 LOCAL_TZ = ZoneInfo("America/Panama")  # PTY station time; UTC-5 all year (no DST).
-# Window = today back through LOOKBACK_DAYS days ago, inclusive.
+# PRIMARY window = today back through LOOKBACK_DAYS days ago, inclusive.
 # Spec was "D0 to D-1", but the source lags: on 2026-09-04 the report had ZERO
 # rows dated 09/04 at 08:55 Panama (explicit 09/04-09/04 filter -> "Query
 # returned no matching rows"), while rows dated 09/03 were still being added
@@ -70,7 +70,30 @@ LOCAL_TZ = ZoneInfo("America/Panama")  # PTY station time; UTC-5 all year (no DS
 # empty and D-1 keeps filling up during D0. Pulling D-2 as well costs nothing
 # (the Web App upserts, so re-posting known ids just refreshes them) and
 # guarantees every day is re-synced ~12 times after it ends.
+# Also: the report's Date Range filter is NOT on the "date" column - it is on
+# a UTC timestamp (finish time). A mission dated 08/31 that finished at 19:00
+# Panama (= 00:00 UTC 09/01) only shows up in a window that starts on 09/01.
+# The D-2 lookback covers that too.
 LOOKBACK_DAYS = 2  # "D0 to D-2": today, yesterday and the day before, inclusive.
+
+# BACKFILL window - one extra, older 3-day chunk per run, rotating by slot.
+# WHY: an audit on 2026-09-19 (full re-pull of 09/01-09/18 vs the sheet)
+# found the sheet short by 15-23 rows on EVERY day from 09/01 to 09/12 and
+# exactly complete for 09/13-09/18. The missing rows were ordinary missions
+# (normal assign/start/finish times on their own day) that the source only
+# exposes about 6-7 days after the fact - i.e. AFTER the D-2..D0 window has
+# moved past them, so no run ever saw them. ~1% of a month, every month.
+# Fix: besides D-2..D0, each run re-pulls one older chunk chosen by the
+# run's 6-hour slot (00:07 -> D-5..D-3, 06:07 -> D-8..D-6, 12:07 -> D-11..D-9,
+# 18:07 -> D-14..D-12), so every day is re-synced again at 3-5, 6-8, 9-11
+# and 12-14 days of age. Chunks are 3 days because 6-day windows timed out
+# on Sisense at scheduled hours during the audit while 3-day ones never did.
+# Rows are upserted, so this only ever adds/refreshes; total ~13k rows/run.
+BACKFILL_CHUNK_DAYS = 3
+BACKFILL_SLOTS = 4  # = number of runs per day
+# Manual override for a one-off catch-up (workflow_dispatch inputs or env):
+# BACKFILL_START="09/01/2026" BACKFILL_END="09/12/2026" replaces the rotating
+# chunk with that exact range (scraped in BACKFILL_CHUNK_DAYS pieces).
 SCRAPE_ATTEMPTS = 3  # whole-scrape retries with a fresh browser (see main()).
 SCRAPE_RETRY_DELAY_S = 60
 WEBAPP_URL = os.environ["SHEETS_WEBAPP_URL"]
@@ -171,18 +194,52 @@ def check_token():
     webapp_request("GET", timeout=30)
 
 
+def _fmt(d):
+    return d.strftime("%m/%d/%Y")
+
+
 def compute_date_range_mmddyyyy():
-    """D0 to D-LOOKBACK_DAYS: today (America/Panama) and today minus LOOKBACK_DAYS, both
-    formatted MM/DD/YYYY for Periscope's Custom Range Start/End Date inputs.
-    Computed fresh on every call so the window is always "as of right now",
-    not pinned to whatever day the code was last edited.
+    """Primary window: D-LOOKBACK_DAYS to D0 (America/Panama), MM/DD/YYYY for
+    Periscope's Custom Range Start/End Date inputs. Computed fresh on every
+    call so the window is always "as of right now".
     """
     today = datetime.now(LOCAL_TZ).date()
-    start = today - timedelta(days=LOOKBACK_DAYS)
-    return start.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y")
+    return _fmt(today - timedelta(days=LOOKBACK_DAYS)), _fmt(today)
 
 
-def scrape_window_csv():
+def compute_windows():
+    """All (label, start, end) windows this run must pull, primary first.
+
+    - primary: D-2..D0 (see LOOKBACK_DAYS)
+    - backfill: BACKFILL_START/BACKFILL_END if set (manual catch-up, cut into
+      BACKFILL_CHUNK_DAYS pieces), else the rotating chunk for this run's
+      slot (see BACKFILL_CHUNK_DAYS). Slot = Panama hour // 6, which still
+      lands right when GitHub starts a scheduled run a couple of hours late.
+    """
+    now = datetime.now(LOCAL_TZ)
+    today = now.date()
+    windows = [("primary D-%d..D0" % LOOKBACK_DAYS, _fmt(today - timedelta(days=LOOKBACK_DAYS)), _fmt(today))]
+
+    bf_start, bf_end = os.environ.get("BACKFILL_START", "").strip(), os.environ.get("BACKFILL_END", "").strip()
+    if bf_start and bf_end:
+        a = datetime.strptime(bf_start, "%m/%d/%Y").date()
+        b = datetime.strptime(bf_end, "%m/%d/%Y").date()
+        while a <= b:
+            c = min(a + timedelta(days=BACKFILL_CHUNK_DAYS - 1), b)
+            windows.append(("manual backfill", _fmt(a), _fmt(c)))
+            a = c + timedelta(days=1)
+        return windows
+
+    slot = (now.hour // (24 // BACKFILL_SLOTS)) % BACKFILL_SLOTS
+    end = today - timedelta(days=LOOKBACK_DAYS + 1 + slot * BACKFILL_CHUNK_DAYS)
+    start = end - timedelta(days=BACKFILL_CHUNK_DAYS - 1)
+    age_hi = (today - start).days
+    age_lo = (today - end).days
+    windows.append(("backfill slot %d D-%d..D-%d" % (slot, age_hi, age_lo), _fmt(start), _fmt(end)))
+    return windows
+
+
+def scrape_window_csv(start_str, end_str):
     """Filter the report's Data widget to a rolling D0-to-D-1 window and pull
     its CSV export.
 
@@ -205,7 +262,6 @@ def scrape_window_csv():
     when there's nothing to export, so this has to be checked for explicitly
     rather than treated as a scrape failure.
     """
-    start_str, end_str = compute_date_range_mmddyyyy()
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1600, "height": 1000})
@@ -496,42 +552,28 @@ def post_rows(rows: list):
     )
 
 
-def main():
-    check_token()
-
-    start_str, end_str = compute_date_range_mmddyyyy()
-    print(f"Pulling 'Copa - Master Report' data for {start_str} to {end_str} (D-{LOOKBACK_DAYS} to D0, America/Panama)...")
-
-    # Whole-scrape retry with a fresh browser. Every failure seen on the
-    # scheduled runs so far has been Sisense being slow/unresponsive at
-    # that hour rather than anything wrong with the page or the code, and
-    # a second attempt a minute later is cheap compared to losing a whole
-    # 12-hour sync window. The debug screenshot/HTML from the LAST failed
-    # attempt is what ends up in the workflow's artifacts.
-    csv_text = None
+def scrape_with_retry(start_str, end_str):
+    """Whole-scrape retry with a fresh browser. Every failure seen on the
+    scheduled runs so far has been Sisense being slow/unresponsive at that
+    hour rather than anything wrong with the page or the code, and a second
+    attempt a minute later is cheap compared to losing a whole sync window.
+    The debug screenshot/HTML from the LAST failed attempt is what ends up
+    in the workflow's artifacts.
+    """
     last_exc = None
     for attempt in range(1, SCRAPE_ATTEMPTS + 1):
         try:
-            csv_text = scrape_window_csv()
-            last_exc = None
-            break
+            return scrape_window_csv(start_str, end_str)
         except Exception as exc:  # noqa: BLE001 - deliberately broad, see above
             last_exc = exc
-            print(f"Scrape attempt {attempt}/{SCRAPE_ATTEMPTS} failed: {exc}", file=sys.stderr)
+            print(f"Scrape attempt {attempt}/{SCRAPE_ATTEMPTS} for {start_str}-{end_str} failed: {exc}", file=sys.stderr)
             if attempt < SCRAPE_ATTEMPTS:
                 print(f"Retrying in {SCRAPE_RETRY_DELAY_S}s with a fresh browser...", file=sys.stderr)
                 time.sleep(SCRAPE_RETRY_DELAY_S)
-    if last_exc is not None:
-        raise last_exc
+    raise last_exc
 
-    if csv_text is None:
-        print(f"No rows for {start_str} to {end_str} - nothing to pull. Will retry next run.")
-        return
 
-    rows = parse_csv_rows(csv_text)
-    print(f"Scraped {len(rows)} rows for {start_str} to {end_str}.")
-
-    result = post_rows(rows)
+def print_result(result):
     print(
         f"Posted {result.get('rows_received')} rows: "
         f"{result.get('rows_updated')} updated in place, {result.get('rows_appended')} appended; "
@@ -541,6 +583,39 @@ def main():
     )
     for name, stats in sorted((result.get("files") or {}).items()):
         print(f"  {name}: {stats}")
+
+
+def main():
+    check_token()
+
+    windows = compute_windows()
+    print("Windows this run (America/Panama): " + "; ".join(f"{lbl} = {a}..{b}" for lbl, a, b in windows))
+
+    failures = []
+    for label, start_str, end_str in windows:
+        print(f"Pulling 'Copa - Master Report' data for {start_str} to {end_str} ({label})...")
+        try:
+            csv_text = scrape_with_retry(start_str, end_str)
+        except Exception as exc:  # noqa: BLE001
+            # The primary window is what the pipeline exists for - a failure
+            # there fails the run. A backfill chunk is best-effort: it comes
+            # around again on the next day's same slot, so log and go on.
+            if label.startswith("primary"):
+                raise
+            print(f"Backfill window {start_str}-{end_str} skipped after retries: {exc}", file=sys.stderr)
+            failures.append(label)
+            continue
+
+        if csv_text is None:
+            print(f"No rows for {start_str} to {end_str} - nothing to post for this window.")
+            continue
+
+        rows = parse_csv_rows(csv_text)
+        print(f"Scraped {len(rows)} rows for {start_str} to {end_str}.")
+        print_result(post_rows(rows))
+
+    if failures:
+        print(f"Note: {len(failures)} backfill window(s) skipped this run: {', '.join(failures)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
